@@ -2,6 +2,7 @@
 
 #include "board.h"
 #include "config.h"
+#include "dedup.h"
 #include "frame.h"
 #include "log.h"
 #include "radio.h"
@@ -21,8 +22,12 @@ uint16_t gTxSeq = 0;
 uint16_t gReportSeq = 0;
 uint32_t gLastParsedUartMs = 0;
 uint32_t gNextTxAtMs = 0;
+uint32_t gNextFwdTxAtMs = 0;
 uint32_t gLastStatusReportMs = 0;
 uint8_t gLastReportedFlags = 0xFFU;
+uint32_t gFwdWindowStartMs = 0;
+uint8_t gFwdCountInWindow = 0;
+bool gFwdLmLoggedInWindow = false;
 
 uint16_t gParsedFreqMHz[MAX_FREQS] = {0};
 uint8_t gParsedFreqCount = 0;
@@ -31,6 +36,7 @@ uint8_t SDR_OK = 0;
 constexpr uint32_t BEACON_SLOT_PERIOD_MS = 1000UL;
 constexpr uint32_t WINDOW_TICK_PERIOD_MS = 1000UL;
 constexpr uint8_t TX_QUEUE_CAPACITY = 4U;
+constexpr uint8_t FWD_QUEUE_CAPACITY = 6U;
 constexpr uint8_t TX_FRAME_MAX = 64U;
 constexpr uint32_t RPI_UART_FRESH_MS = 15000UL;
 constexpr uint16_t LOW_BATT_THRESHOLD_MV = 3300U;
@@ -47,10 +53,22 @@ struct TxItem {
   uint8_t data[TX_FRAME_MAX];
 };
 
+struct FwdItem {
+  uint8_t len;
+  uint8_t data[TX_FRAME_MAX];
+  uint8_t src;
+  uint16_t msgId;
+};
+
 TxItem gTxQueue[TX_QUEUE_CAPACITY] = {};
 uint8_t gTxHead = 0;
 uint8_t gTxTail = 0;
 uint8_t gTxCount = 0;
+
+FwdItem gFwdQueue[FWD_QUEUE_CAPACITY] = {};
+uint8_t gFwdHead = 0;
+uint8_t gFwdTail = 0;
+uint8_t gFwdCount = 0;
 
 bool isSep(char ch) {
   return (ch == ',') || (ch == ' ') || (ch == '\t');
@@ -89,6 +107,50 @@ bool txQueuePush(const uint8_t* data, uint8_t len) {
   return true;
 }
 
+bool fwdQueuePush(const uint8_t* data, uint8_t len, uint8_t src, uint16_t msgId) {
+  if ((data == nullptr) || (len == 0U) || (len > TX_FRAME_MAX)) {
+    return false;
+  }
+  if (gFwdCount >= FWD_QUEUE_CAPACITY) {
+    // Forward queue policy: drop newest frame.
+    logEvent("FQSAT");
+    return false;
+  }
+
+  gFwdQueue[gFwdTail].len = len;
+  gFwdQueue[gFwdTail].src = src;
+  gFwdQueue[gFwdTail].msgId = msgId;
+  for (uint8_t i = 0; i < len; ++i) {
+    gFwdQueue[gFwdTail].data[i] = data[i];
+  }
+
+  gFwdTail = static_cast<uint8_t>((gFwdTail + 1U) % FWD_QUEUE_CAPACITY);
+  ++gFwdCount;
+  return true;
+}
+
+bool forwardRateAllow(uint32_t nowMs) {
+  if ((nowMs - gFwdWindowStartMs) >= WINDOW_MS) {
+    gFwdWindowStartMs = nowMs;
+    gFwdCountInWindow = 0U;
+    gFwdLmLoggedInWindow = false;
+  }
+  if (gFwdCountInWindow < MAX_FORWARDS_PER_WINDOW) {
+    return true;
+  }
+  if (!gFwdLmLoggedInWindow) {
+    logEvent("FWDLM");
+    gFwdLmLoggedInWindow = true;
+  }
+  return false;
+}
+
+void forwardRateConsume() {
+  if (gFwdCountInWindow < 255U) {
+    ++gFwdCountInWindow;
+  }
+}
+
 const TxItem* txQueueFront() {
   if (gTxCount == 0U) {
     return nullptr;
@@ -102,6 +164,21 @@ void txQueuePop() {
   }
   gTxHead = static_cast<uint8_t>((gTxHead + 1U) % TX_QUEUE_CAPACITY);
   --gTxCount;
+}
+
+const FwdItem* fwdQueueFront() {
+  if (gFwdCount == 0U) {
+    return nullptr;
+  }
+  return &gFwdQueue[gFwdHead];
+}
+
+void fwdQueuePop() {
+  if (gFwdCount == 0U) {
+    return;
+  }
+  gFwdHead = static_cast<uint8_t>((gFwdHead + 1U) % FWD_QUEUE_CAPACITY);
+  --gFwdCount;
 }
 
 uint16_t frameSeq(const uint8_t* frame, uint8_t len) {
@@ -142,6 +219,87 @@ void runTxScheduler(uint32_t nowMs) {
 
   (void)radioStartRx();
   gNextTxAtMs = nowMs + randomBackoffMs();
+}
+
+void runForwardScheduler(uint32_t nowMs) {
+  const FwdItem* item = fwdQueueFront();
+  if (item == nullptr) {
+    gNextFwdTxAtMs = 0U;
+    return;
+  }
+
+  if (gNextFwdTxAtMs == 0U) {
+    gNextFwdTxAtMs = nowMs + randomBackoffMs();
+    return;
+  }
+
+  if (!timeReached(nowMs, gNextFwdTxAtMs)) {
+    return;
+  }
+
+  if (!radioIsIdle()) {
+    return;
+  }
+
+  if (radioSend(item->data, item->len)) {
+    logEvent3("FWDOK", item->src, item->msgId);
+    fwdQueuePop();
+  } else {
+    logEvent2("FWDF", radioLastCode());
+  }
+
+  (void)radioStartRx();
+  gNextFwdTxAtMs = nowMs + randomBackoffMs();
+}
+
+bool meshShouldForward(const uint8_t* frame, uint8_t len, uint32_t nowMs, uint8_t& srcOut, uint16_t& msgIdOut) {
+  if (!frameCrcOk(frame, len)) {
+    return false;
+  }
+  if (!frameGetSrcMsgId(frame, len, srcOut, msgIdOut)) {
+    return false;
+  }
+  if (dedupSeen(srcOut, msgIdOut, nowMs)) {
+    return false;
+  }
+  uint8_t ttl = 0U;
+  if (!frameGetTTL(frame, len, ttl)) {
+    return false;
+  }
+  if (ttl == 0U) {
+    return false;
+  }
+  if (frameIsNoRelay(frame, len)) {
+    return false;
+  }
+  if (!forwardRateAllow(nowMs)) {
+    return false;
+  }
+  return true;
+}
+
+void meshOnRx(const uint8_t* frame, uint8_t len, uint32_t nowMs) {
+  uint8_t srcForDedup = 0U;
+  uint16_t msgIdForDedup = 0U;
+  if (!meshShouldForward(frame, len, nowMs, srcForDedup, msgIdForDedup)) {
+    return;
+  }
+
+  uint8_t fwdBuf[TX_FRAME_MAX] = {0};
+  for (uint8_t i = 0U; i < len; ++i) {
+    fwdBuf[i] = frame[i];
+  }
+
+  if (!frameDecTTLIncHopsAndRecrc(fwdBuf, len)) {
+    return;
+  }
+
+  dedupRemember(srcForDedup, msgIdForDedup, nowMs);
+  if (fwdQueuePush(fwdBuf, len, srcForDedup, msgIdForDedup)) {
+    forwardRateConsume();
+    // Sparse RX log: only when packet passes mesh decision and is queued.
+    logEvent3("RXOK", frame[4], len);
+  }
 }
 
 void pushFreqIfValid(uint32_t value, uint16_t outMHz[MAX_FREQS], uint8_t& outCount) {
@@ -318,8 +476,8 @@ void appInit() {
       frameHead8[i] = frame[i];
     }
     logHex8("FHEX", frameHead8);
-    const uint16_t frameCrc = static_cast<uint16_t>(frame[7]) |
-                              static_cast<uint16_t>(static_cast<uint16_t>(frame[8]) << 8);
+    const uint16_t frameCrc = static_cast<uint16_t>(frame[PING_FRAME_LEN - 2U]) |
+                              static_cast<uint16_t>(static_cast<uint16_t>(frame[PING_FRAME_LEN - 1U]) << 8);
     logEvent2("FCRC", frameCrc);
 
     if (parsePingFrame(frame, PING_FRAME_LEN, seqOut, srcOut, bootOut, errCode)) {
@@ -346,6 +504,7 @@ void appTick(uint32_t nowMs) {
     gLastWindowTickMs = nowMs;
     gLastPingEnqueueMs = nowMs;
     gLastStatusReportMs = nowMs;
+    gFwdWindowStartMs = nowMs;
     gTimebaseReady = true;
   }
 
@@ -372,6 +531,7 @@ void appTick(uint32_t nowMs) {
   }
 
   if constexpr (RADIO_TEST_TX_ACTIVE || RADIO_TEST_RX_ACTIVE) {
+    runForwardScheduler(nowMs);
     runTxScheduler(nowMs);
   }
 
@@ -379,18 +539,7 @@ void appTick(uint32_t nowMs) {
     uint8_t rxBuf[32];
     const uint8_t rxLen = radioRead(rxBuf, sizeof(rxBuf));
     if (rxLen > 0U) {
-      uint16_t seqOut = 0U;
-      uint8_t srcOut = 0U;
-      uint8_t bootOut = 0U;
-      uint8_t errCode = 0U;
-
-      if (parsePingFrame(rxBuf, rxLen, seqOut, srcOut, bootOut, errCode)) {
-        logEvent3("RXOK", seqOut, radioLastRssi());
-        logEvent2("RSNR", radioLastSnr());
-        boardLedPulse(100);
-      } else {
-        logEvent2("RXBAD", errCode);
-      }
+      meshOnRx(rxBuf, rxLen, nowMs);
     }
   }
 

@@ -1,4 +1,7 @@
 from tools.protocol_model import (
+    FRAME_FLAG_NO_RELAY,
+    ForwardQueue,
+    ForwardWindowLimiter,
     HEADER_LEN,
     PING_FRAME_LEN,
     PING_TYPE,
@@ -10,8 +13,11 @@ from tools.protocol_model import (
     build_status_flags,
     calc_last_uart_age_s,
     crc16_ccitt_false,
+    frame_crc_ok,
+    frame_dec_ttl_inc_hops_recrc,
     parse_freq_line_mhz,
     parse_ping_frame,
+    mesh_should_forward,
 )
 
 
@@ -94,3 +100,68 @@ def test_report_tlv_layout_len_and_crc() -> None:
     crc_in = frame[-2] | (frame[-1] << 8)
     crc_calc = crc16_ccitt_false(frame[:-2])
     assert crc_in == crc_calc
+
+
+def test_mesh_forward_rejects_ttl_zero_and_accepts_after_recrc() -> None:
+    frame = bytearray(build_ping_frame(net_id=1, src_id=7, dst_id=0xFF, boot_id=1, seq=42))
+    frame[7] = 0  # TTL
+    crc = crc16_ccitt_false(bytes(frame[:-2]))
+    frame[-2] = crc & 0xFF
+    frame[-1] = (crc >> 8) & 0xFF
+
+    assert frame_crc_ok(bytes(frame)) is True
+    assert mesh_should_forward(bytes(frame), dedup_seen=False, rate_allow=True) is False
+
+    frame[7] = 2
+    crc = crc16_ccitt_false(bytes(frame[:-2]))
+    frame[-2] = crc & 0xFF
+    frame[-1] = (crc >> 8) & 0xFF
+    assert mesh_should_forward(bytes(frame), dedup_seen=False, rate_allow=True) is True
+
+    mutated = frame_dec_ttl_inc_hops_recrc(bytes(frame))
+    assert mutated is not None
+    assert mutated[7] == 1
+    assert mutated[8] == 1
+    assert frame_crc_ok(mutated) is True
+
+
+def test_forward_queue_drop_newest_policy() -> None:
+    q = ForwardQueue(capacity=4)
+    assert q.push() is True
+    assert q.push() is True
+    assert q.push() is True
+    assert q.push() is True
+    assert q.size == 4
+    assert q.push() is False  # newest dropped
+    assert q.size == 4
+    assert q.saturated_events == 1
+
+
+def test_forward_window_limiter_resets_on_new_window() -> None:
+    limiter = ForwardWindowLimiter(window_ms=10000, max_forwards_per_window=2)
+
+    assert limiter.allow(1000) is True
+    limiter.consume()
+    assert limiter.allow(2000) is True
+    limiter.consume()
+    assert limiter.allow(3000) is False
+
+    # New window opens, allow again.
+    assert limiter.allow(12050) is True
+
+
+def test_mesh_forward_rejects_no_relay_flag() -> None:
+    frame = bytearray(build_ping_frame(net_id=1, src_id=9, dst_id=0xFF, boot_id=1, seq=77))
+    frame[9] |= FRAME_FLAG_NO_RELAY
+    crc = crc16_ccitt_false(bytes(frame[:-2]))
+    frame[-2] = crc & 0xFF
+    frame[-1] = (crc >> 8) & 0xFF
+
+    assert frame_crc_ok(bytes(frame)) is True
+    assert mesh_should_forward(bytes(frame), dedup_seen=False, rate_allow=True) is False
+
+
+def test_mesh_forward_rejects_when_dedup_already_seen() -> None:
+    frame = build_ping_frame(net_id=1, src_id=10, dst_id=0xFF, boot_id=2, seq=78)
+    assert frame_crc_ok(frame) is True
+    assert mesh_should_forward(frame, dedup_seen=True, rate_allow=True) is False

@@ -8,8 +8,9 @@ PING_TYPE = 0x01
 REPORT_TYPE = 0x10
 TLV_FREQ_LIST = 0x01
 TLV_NODE_STATUS = 0x02
-PING_FRAME_LEN = 9
-HEADER_LEN = 7
+FRAME_FLAG_NO_RELAY = 0x01
+PING_FRAME_LEN = 12
+HEADER_LEN = 10
 MAX_FREQS = 5
 
 
@@ -35,6 +36,9 @@ def build_ping_frame(net_id: int, src_id: int, dst_id: int, boot_id: int, seq: i
             PING_TYPE,
             seq & 0xFF,
             (seq >> 8) & 0xFF,
+            8,   # TTL
+            0,   # HOPS
+            0,   # FLAGS
         ]
     )
     crc = crc16_ccitt_false(head)
@@ -59,7 +63,7 @@ def parse_ping_frame(buf: bytes, expected_net_id: int) -> PingParseResult:
         return PingParseResult(ok=False, err_code=4)
 
     crc_calc = crc16_ccitt_false(buf[:HEADER_LEN])
-    crc_in = buf[7] | (buf[8] << 8)
+    crc_in = buf[-2] | (buf[-1] << 8)
     if crc_calc != crc_in:
         return PingParseResult(ok=False, err_code=3)
 
@@ -160,6 +164,9 @@ def build_report_frame(
             REPORT_TYPE,
             seq & 0xFF,
             (seq >> 8) & 0xFF,
+            8,   # TTL
+            0,   # HOPS
+            0,   # FLAGS
         ]
     )
     full_no_crc = head + payload
@@ -168,3 +175,89 @@ def build_report_frame(
 
     crc = crc16_ccitt_false(full_no_crc)
     return full_no_crc + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+
+def frame_crc_ok(frame: bytes) -> bool:
+    if len(frame) < HEADER_LEN + 2:
+        return False
+    crc_calc = crc16_ccitt_false(frame[:-2])
+    crc_in = frame[-2] | (frame[-1] << 8)
+    return crc_calc == crc_in
+
+
+def frame_get_ttl(frame: bytes) -> int:
+    if len(frame) < HEADER_LEN + 2:
+        return 0
+    return frame[7]
+
+
+def frame_is_no_relay(frame: bytes) -> bool:
+    if len(frame) < HEADER_LEN + 2:
+        return True
+    return (frame[9] & FRAME_FLAG_NO_RELAY) != 0
+
+
+def frame_dec_ttl_inc_hops_recrc(frame: bytes) -> Optional[bytes]:
+    if len(frame) < HEADER_LEN + 2:
+        return None
+    if not frame_crc_ok(frame):
+        return None
+    ttl = frame[7]
+    if ttl == 0:
+        return None
+
+    out = bytearray(frame)
+    out[7] = (out[7] - 1) & 0xFF
+    out[8] = (out[8] + 1) & 0xFF
+    crc = crc16_ccitt_false(bytes(out[:-2]))
+    out[-2] = crc & 0xFF
+    out[-1] = (crc >> 8) & 0xFF
+    return bytes(out)
+
+
+def mesh_should_forward(frame: bytes, *, dedup_seen: bool, rate_allow: bool) -> bool:
+    if not frame_crc_ok(frame):
+        return False
+    if dedup_seen:
+        return False
+    if frame_get_ttl(frame) == 0:
+        return False
+    if frame_is_no_relay(frame):
+        return False
+    if not rate_allow:
+        return False
+    return True
+
+
+@dataclass
+class ForwardQueue:
+    capacity: int
+    size: int = 0
+    saturated_events: int = 0
+
+    def push(self) -> bool:
+        # Firmware policy: drop newest when full.
+        if self.size >= self.capacity:
+            self.saturated_events += 1
+            return False
+        self.size += 1
+        return True
+
+
+@dataclass
+class ForwardWindowLimiter:
+    window_ms: int
+    max_forwards_per_window: int
+    window_start_ms: int = 0
+    count_in_window: int = 0
+
+    def allow(self, now_ms: int) -> bool:
+        if now_ms - self.window_start_ms >= self.window_ms:
+            self.window_start_ms = now_ms
+            self.count_in_window = 0
+        if self.count_in_window < self.max_forwards_per_window:
+            return True
+        return False
+
+    def consume(self) -> None:
+        self.count_in_window += 1
